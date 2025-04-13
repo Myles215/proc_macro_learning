@@ -1,8 +1,13 @@
 extern crate proc_macro2;
 
+use std::fmt::format;
+use std::str::from_utf8;
+
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use syn::{parse_macro_input, Data::Struct, DataStruct, DeriveInput};
 use quote::quote;
+use quote::ToTokens;
 
 
 fn create_macros() -> proc_macro2::TokenStream {
@@ -25,6 +30,20 @@ fn create_macros() -> proc_macro2::TokenStream {
             };
         }
 
+        macro_rules! create_builder_each_setter {
+            ($fname: ident, $argname: ident, Vec<$ftype: ty>) => {
+                pub fn $fname(&mut self, argument: $ftype) -> &mut Self {
+                    if self.$argname.is_none() {
+                        self.$argname = Some(Vec::new());
+                    } 
+
+                    // We assigned this just above
+                    self.$argname.as_mut().unwrap().push(argument);
+                    self
+                }
+            };
+        }
+
         macro_rules! create_final_builder_unwrap {
             ($fname: ident, Option<$ftype: ty>) => {
                 pub fn $fname(argument: &std::option::Option<std::option::Option<$ftype>>) -> std::option::Option<$ftype> {
@@ -34,6 +53,18 @@ fn create_macros() -> proc_macro2::TokenStream {
                         }
                         None => {
                             return None;
+                        }
+                    }
+                }
+            };
+            ($fname: ident, Vec<$ftype: ty>) => {
+                pub fn $fname(argument: &std::option::Option<Vec<$ftype>>) -> Vec<$ftype> {
+                    match argument {
+                        Some(arg) => {
+                            return arg.clone();
+                        }
+                        None => {
+                            return Vec::new();
                         }
                     }
                 }
@@ -50,10 +81,12 @@ fn create_macros() -> proc_macro2::TokenStream {
         macro_rules! validate_field_on_build {
             ($self: ident, $fname: ident, Option<$ftype: ty>) => {
             };
+            ($self: ident, $fname: ident, Vec<$ftype: ty>) => {
+            };
             ($self: ident, $fname: ident, $ftype: ty) => {
                 // Non optional is set to None... whaaat
                 if $self.$fname.is_none() {
-                    return None
+                    panic!{"Non-optional param is set to none {}", stringify!{$fname}}
                 }
             };
         }
@@ -82,10 +115,6 @@ fn generate_member_variables_of_builder(my_struct: &DataStruct) -> proc_macro2::
 fn generate_setter_functions_of_builder(my_struct: &DataStruct) -> proc_macro2::TokenStream {
     let setters = my_struct.fields.iter().map(|field| {
         let name = &field.ident;
-        
-        if field.attrs.len() > 0 {
-            panic!("{:?}", field.attrs);
-        }
 
         let name_as_str = match name {
             Some(thang) => {
@@ -99,10 +128,41 @@ fn generate_setter_functions_of_builder(my_struct: &DataStruct) -> proc_macro2::
 
         let ty = &field.ty;
 
+        let each_setter: proc_macro2::TokenStream = match parse_each_attribute(&field.attrs) {
+            Ok(optional_str) => {
+                match optional_str {
+                    Some(string) => {
+                        // string looks like : ""each"" - cut off the ""
+                        let cut_str: String = match from_utf8(&string.as_bytes()[1..string.len() - 1]) {
+                            Ok(s) => {
+                                s.to_owned()
+                            }
+                            Err(e) => {
+                                panic!("{}", e);
+                            }
+                        };
+                        
+                        let each_name: syn::Ident = syn::Ident::new(&cut_str, Span::call_site());
+                        quote! {
+                            create_builder_each_setter! (#each_name, #name, #ty);
+                        }
+                    },
+                    None => {
+                        quote! {
+                            create_builder_setter! (#name, #ty);
+                        }
+                    }
+                }
+            },
+            Err(error) => {
+                panic!("Error parsing attributes: {}", error);
+            }
+        };
+
         quote! {
             create_final_builder_unwrap! (#setter_name, #ty);
 
-            create_builder_setter! (#name, #ty);
+            #each_setter
         }
     });
 
@@ -165,7 +225,49 @@ fn generate_validators(my_struct: &DataStruct) -> proc_macro2::TokenStream {
 }
 
 
-#[proc_macro_derive(Builder)]
+// Looks for each attriute (our attribute)
+fn parse_each_attribute(attr_vec: &Vec<syn::Attribute>) -> Result<Option<String>, String> {
+    if attr_vec.len() == 0 {
+        return Ok(None);
+    }
+
+    let attr = &attr_vec[0];
+
+    if attr.path().is_ident("builder") {
+        match attr.parse_args() {
+            Ok(x) => {
+                match x {
+                    syn::Meta::NameValue(nv) => {
+                        match nv.path.get_ident() {
+                            Some(valid_ident) => {
+                                if *valid_ident == proc_macro2::Ident::new("each", Span::call_site()) {
+                                    return Ok(Some(nv.value.to_token_stream().to_string()));
+                                }
+                                else {
+                                    panic!("expected `builder(each = \"...\")`");
+                                }
+                            }
+                            None => {
+                                return Err(format(format_args!("Param ident cannot be None")));
+                            }
+                        }
+                    }
+                    _ => {
+                        panic!("Unexpected");
+                    }
+                }
+            }
+            Err(e) => {
+                panic!("{}", e);
+            }
+        }
+    }
+
+    return Ok(None);
+}
+
+
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
 
     pub fn gen_builder_str_for_struct(my_struct: DataStruct, struct_name_ident: syn::Ident) -> TokenStream {
@@ -212,8 +314,6 @@ pub fn derive(input: TokenStream) -> TokenStream {
         Struct(my_struct) => gen_builder_str_for_struct(my_struct, struct_name_ident),
         _ => TokenStream::new(),
     };
-
-   //panic!("{}", description_str);
 
     return description_str;
 }
